@@ -826,13 +826,42 @@ if "ZIP" not in EXR_COMPRESSION_CHOICES:
     EXR_COMPRESSION_CHOICES.insert(0, "ZIP")
 
 
+_PNG_PROBE_RESULT: str | None | bool = False
+
+def _probe_png_writer() -> str | None:
+    """Test lossless 16-bit PNG support without touching EXR settings."""
+    global _PNG_PROBE_RESULT
+    if _PNG_PROBE_RESULT is not False:
+        return _PNG_PROBE_RESULT
+    if not HAVE_CV:
+        _PNG_PROBE_RESULT = "OpenCV and NumPy are required for PNG output."
+        return _PNG_PROBE_RESULT
+    try:
+        samples = (
+            np.full((4, 4), 32768, dtype=np.uint16),
+            np.full((4, 4, 3), 32768, dtype=np.uint16),
+            np.full((4, 4, 4), 32768, dtype=np.uint16),
+        )
+        for sample in samples:
+            ok, encoded = cv2.imencode(".png", sample, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            if not ok or encoded is None:
+                raise RuntimeError("OpenCV refused a 16-bit PNG test frame")
+            decoded = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+            if decoded is None or decoded.dtype != np.uint16 or decoded.shape != sample.shape:
+                raise RuntimeError("16-bit PNG write/read test returned an unexpected format")
+    except Exception as exc:
+        _PNG_PROBE_RESULT = f"16-bit PNG writer test failed: {type(exc).__name__}: {exc}"
+        return _PNG_PROBE_RESULT
+    _PNG_PROBE_RESULT = None
+    return None
+
+
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mxf"}
 IMAGE_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 OUTPUT_CHOICES = ("alpha", "fg", "checker", "cutout")
 OUTPUT_LABELS = {"alpha": "Alpha matte", "fg": "Foreground",
                  "checker": "Checkerboard", "cutout": "Cutout"}
-PNG_POSTPROCESS_SENTINEL = "__CORRIDORKEY_POSTPROCESS_EXR_TO_PNG__"
 
 # ---- palette: (light, dark) ------------------------------------------------
 BG = ("#F2F2F7", "#000000")
@@ -3854,6 +3883,39 @@ def _load_frame_uncached(path: Path, frac: float, caps: dict | None = None, ocio
             )
         info.update(count=len(files), idx=idx, path=str(source_path))
 
+    elif path.is_file() and path.suffix.lower() in IMAGE_EXTS:
+        # A single still image is a valid one-frame source, not a video.
+        # Read it directly instead of allowing it to reach VideoCapture.
+        source_path = path
+        is_exr = source_path.suffix.lower() == ".exr"
+        sony_log_profile, sony_log_reason = (
+            _sony_profile_for_exr(source_path, enabled_for_input=apply_sony_lut)
+            if is_exr else (None, "not an EXR input")
+        )
+        img = _read_image(
+            source_path,
+            "" if sony_log_profile else ocio_selection,
+            diagnostics=info,
+            preserve_encoded_values=bool(sony_log_profile),
+        )
+        if sony_log_profile:
+            img, sony_lut_name, apply_reason = _apply_sony_log_lut_pil(img, sony_log_profile)
+            info.update(
+                sony_lut_applied=bool(sony_lut_name),
+                sony_lut_name=sony_lut_name,
+                sony_log_profile=sony_log_profile,
+                sony_lut_reason=f"{sony_log_reason}; {apply_reason}",
+            )
+        elif is_exr:
+            info.update(
+                sony_lut_applied=False,
+                sony_log_profile="",
+                sony_lut_name="",
+                sony_lut_reason=sony_log_reason,
+            )
+        source_size = img.size
+        info.update(count=1, idx=0, path=str(source_path))
+
     elif path.suffix.lower() in VIDEO_EXTS:
         if not HAVE_CV:
             raise RuntimeError("Preview needs opencv-python and numpy")
@@ -4098,104 +4160,6 @@ def find_output(outdir: Path | None, tab: str) -> Path | None:
         if hits:
             return hits[0]
     return None
-
-
-def _convert_exr_output_sequences_to_png(outdir: Path) -> tuple[int, int]:
-    """Convert EXR channel folders to 16-bit PNG sequences for the PNG UI format.
-
-    The current inference CLI writes EXR sequences reliably; PNG is implemented as
-    a post-render image-sequence conversion so older infer.py copies do not need a
-    new --output_format choice. Original EXR frames are removed only after every
-    output channel has converted successfully.
-    """
-    if not HAVE_CV:
-        raise RuntimeError("PNG sequence conversion requires OpenCV and NumPy.")
-    channel_patterns = (
-        "*_alpha_exr", "*_fg_exr", "*_checker_comp_despill*_exr", "*_cutout_exr",
-    )
-    source_dirs = []
-    seen = set()
-    for pattern in channel_patterns:
-        for folder in sorted(outdir.glob(pattern)):
-            if folder.is_dir():
-                key = os.path.normcase(os.path.normpath(str(folder.resolve())))
-                if key not in seen:
-                    seen.add(key)
-                    source_dirs.append(folder)
-    if not source_dirs:
-        raise RuntimeError(
-            "The EXR render finished, but no output channel folders ending in '_exr' were found. "
-            "Check the renderer's output naming before selecting PNG.")
-
-    created_targets: list[Path] = []
-    pending_sources: list[tuple[Path, list[Path]]] = []
-    total_frames = 0
-    try:
-        for source_dir in source_dirs:
-            exr_frames = sorted(
-                frame for frame in source_dir.rglob("*")
-                if frame.is_file() and frame.suffix.lower() == ".exr")
-            if not exr_frames:
-                continue
-            if source_dir.name.lower().endswith("_exr"):
-                target_dir = source_dir.with_name(source_dir.name[:-4] + "_png")
-            else:
-                target_dir = source_dir.with_name(source_dir.name + "_png")
-            if target_dir.exists():
-                raise RuntimeError(f"PNG output already exists: {target_dir}")
-            target_dir.mkdir(parents=True, exist_ok=False)
-            created_targets.append(target_dir)
-            for frame_index, source_frame in enumerate(exr_frames, 1):
-                pixels = cv2.imread(str(source_frame), cv2.IMREAD_UNCHANGED)
-                if pixels is None or not getattr(pixels, "size", 0):
-                    raise RuntimeError(f"Could not read EXR frame: {source_frame}")
-                if pixels.dtype.kind == "f":
-                    # PNG is SDR; retain precision with a 16-bit output sequence.
-                    # Values are kept in their normalized 0..1 range (no per-frame
-                    # auto-leveling, which would cause temporal flicker).
-                    pixels = np.nan_to_num(pixels, nan=0.0, posinf=1.0, neginf=0.0)
-                    pixels = np.clip(pixels, 0.0, 1.0)
-                    pixels = np.rint(pixels * 65535.0).astype(np.uint16)
-                elif pixels.dtype == np.uint8:
-                    pixels = pixels
-                elif pixels.dtype == np.uint16:
-                    pixels = pixels
-                else:
-                    pixels = np.clip(pixels, 0, 65535).astype(np.uint16)
-                relative = source_frame.relative_to(source_dir).with_suffix(".png")
-                target_frame = target_dir / relative
-                target_frame.parent.mkdir(parents=True, exist_ok=True)
-                params = ([cv2.IMWRITE_PNG_COMPRESSION, 3]
-                          if hasattr(cv2, "IMWRITE_PNG_COMPRESSION") else [])
-                if not cv2.imwrite(str(target_frame), pixels, params):
-                    raise RuntimeError(f"Could not write PNG frame: {target_frame}")
-                total_frames += 1
-            pending_sources.append((source_dir, exr_frames))
-        if not pending_sources or total_frames < 1:
-            raise RuntimeError("No EXR frames were found in the selected output channel folders.")
-    except Exception:
-        for target_dir in reversed(created_targets):
-            shutil.rmtree(target_dir, ignore_errors=True)
-        raise
-
-    # Remove only converted EXR images; preserve any non-image metadata files.
-    for source_dir, exr_frames in pending_sources:
-        for source_frame in exr_frames:
-            try:
-                source_frame.unlink()
-            except OSError:
-                pass
-        for folder in sorted((p for p in source_dir.rglob("*") if p.is_dir()),
-                             key=lambda p: len(p.parts), reverse=True):
-            try:
-                folder.rmdir()
-            except OSError:
-                pass
-        try:
-            source_dir.rmdir()
-        except OSError:
-            pass
-    return total_frames, len(pending_sources)
 
 
 def checker_bg(size, tile: int = 14) -> Image.Image:
@@ -12319,13 +12283,13 @@ print("CORRIDORKEY_GPU_PROBE=" + json.dumps(r))
         # a stale PNG value saved in the shared preferences.
         if output_format == "png" and getattr(self, "_active_workspace_layout", "") != "Queue Studio":
             output_format = "video"
-        # PNG is generated as a 16-bit image sequence from the backend's EXR
-        # sequence. This keeps compatibility with existing infer.py versions.
-        render_format = "exr" if output_format == "png" else output_format
+        # PNG is a native 16-bit sequence output. The backend writes the same
+        # display-referred sRGB pixel values used by its video render path;
+        # no EXR staging, extra gamma, OCIO, LUT, or conversion pass is applied.
+        render_format = output_format
         cmd += ["--output_format", render_format]
-        if output_format == "png":
-            cmd.append(PNG_POSTPROCESS_SENTINEL)
         self._exr_fallback_notice = ""
+        # EXR compression controls apply only to EXR outputs, never PNG.
         if render_format == "exr":
             compression = str(value("v_exr_compression")).strip()
             if compression.startswith("DWRB"):
@@ -12408,7 +12372,11 @@ print("CORRIDORKEY_GPU_PROBE=" + json.dumps(r))
         if own and self.v_batch.get() and Path(src).is_dir() and not self._clips():
             return "No video files were found in that folder."
         self._exr_fallback_notice = ""
-        if self.v_format.get() in ("exr", "png"):
+        if self.v_format.get() == "png":
+            png_error = _probe_png_writer()
+            if png_error:
+                return "PNG output is unavailable in this Python/OpenCV environment.\n\n" + png_error
+        if self.v_format.get() == "exr":
             requested = self.v_exr_compression.get().strip()
             compression = "DWAB" if requested.startswith("DWRB") else requested
             backend_supports_compression = _backend_supports_exr_compression()
@@ -12546,15 +12514,16 @@ print("CORRIDORKEY_GPU_PROBE=" + json.dumps(r))
             if self.stop_requested:
                 break
             t0 = time.monotonic()
-            png_output = PNG_POSTPROCESS_SENTINEL in cmd
-            render_cmd = [part for part in cmd if part != PNG_POSTPROCESS_SENTINEL]
+            render_cmd = list(cmd)
+            png_output = ("--output_format" in render_cmd and
+                          render_cmd[render_cmd.index("--output_format") + 1] == "png")
             self.msgs.put(("jobstat", str(clip), qid, "RUNNING"))
             self.msgs.put(("clipstart", f"Clip {i} of {len(jobs)}  \u2022  {clip.name}",
                            str(clip), qid))
             self.msgs.put(("line", f"=== {clip.name} ===", "head"))
             self.msgs.put(("line", "> " + " ".join(render_cmd), "dim"))
             if png_output:
-                self.msgs.put(("line", "[PNG] Rendering EXR staging frames, then converting channels to 16-bit PNG sequences.", "head"))
+                self.msgs.put(("line", "[PNG] Writing native 16-bit PNG frames directly. No EXR staging or color-conversion pass.", "head"))
             try:
                 self.proc = subprocess.Popen(
                     render_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
@@ -12582,16 +12551,6 @@ print("CORRIDORKEY_GPU_PROBE=" + json.dumps(r))
             if self.stop_requested:
                 self.msgs.put(("jobstat", str(clip), qid, "STOPPED"))
                 break
-            if code == 0 and png_output:
-                try:
-                    self.msgs.put(("line", "[PNG] Converting EXR frames to PNG...", "head"))
-                    png_frames, png_channels = _convert_exr_output_sequences_to_png(Path(outdir))
-                    self.msgs.put(("line", f"[PNG] Wrote {png_frames} 16-bit PNG frame(s) across {png_channels} output channel(s).", "ok"))
-                except Exception as exc:
-                    code = -2
-                    self.msgs.put(("line", f"[PNG] Conversion failed: {exc}", "err"))
-                    self.msgs.put(("detailed_error", "PNG sequence conversion", str(exc),
-                                   traceback.format_exc(), f"Input clip: {clip}; output folder: {outdir}"))
             took = fmt_time(time.monotonic() - t0)
             if code == 0:
                 self.msgs.put(("line", f"[DONE] {clip.name}  in {took}\n", "ok"))

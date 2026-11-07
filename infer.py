@@ -47,7 +47,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="CorridorKey v2 native-resolution raw-video inference")
     ap.add_argument("--input", required=True,
-                    help="Input video file or directory of image frames.")
+                    help="Input video, one still image, or directory of image frames.")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--weights", default=None,
                     help="Runtime checkpoint (.safetensors or legacy .pt). "
@@ -91,13 +91,14 @@ def main():
     ap.add_argument("--linear_brightness", type=float, default=1.0)
     ap.add_argument("--linear_contrast", type=float, default=1.0)
     ap.add_argument("--linear_contrast_pivot", type=float, default=0.18)
-    ap.add_argument("--output_format", choices=("video", "exr"),
+    ap.add_argument("--output_format", choices=("video", "exr", "png"),
                     default="video",
-                    help=("video: ffmpeg-encoded preview videos (display-"
-                          "referred, clipped to [0,1]). exr: unclamped scene-"
-                          "linear OpenEXR image sequences (full HDR float)."))
+                    help=("video: ffmpeg-encoded preview videos; exr: unclamped "
+                          "scene-linear OpenEXR sequences; png: direct 16-bit "
+                          "display-referred PNG sequences (no EXR staging)."))
     ap.add_argument("--exr_dtype", choices=("half", "float"), default="half",
                     help="EXR pixel type for --output_format exr. Default: half.")
+    ap.add_argument("--exr_compression", choices=("ZIP", "PIZ", "RLE", "ZIPS", "PXR24", "B44", "B44A", "DWAA", "DWAB", "NONE"), default="ZIP")
     ap.add_argument("--ffmpeg_bin", default="ffmpeg")
     ap.add_argument("--ffmpeg_codec", default="libx264")
     ap.add_argument("--crf", type=int, default=12)
@@ -119,7 +120,8 @@ def main():
 
     if not torch.cuda.is_available():
         raise RuntimeError("CorridorKey v2 runtime requires a CUDA GPU.")
-    require_ffmpeg(args.ffmpeg_bin)
+    if args.output_format == "video":
+        require_ffmpeg(args.ffmpeg_bin)
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
     writer_cfg = WriterConfig(
@@ -165,6 +167,7 @@ def main():
         despill_strength=args.despill_strength,
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
+        exr_compression=args.exr_compression,
     )
     model = load_model(paths, device="cuda")
     run_inference(

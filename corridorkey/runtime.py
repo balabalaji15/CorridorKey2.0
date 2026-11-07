@@ -16,6 +16,7 @@ from . import color_utils as cu
 from .model import CorridorKeyV3
 from .video_io import (
     ExrSequenceWriter,
+    PngSequenceWriter,
     ThreadedVideoWriter,
     WriterConfig,
     apply_linear_adjust,
@@ -127,6 +128,7 @@ class InferenceConfig:
     despill_strength: float = 0.5
     output_format: str = "video"
     exr_dtype: str = "half"
+    exr_compression: str = "ZIP"
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -730,6 +732,18 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
     return rendered
 
 
+def _render_predictions_png_torch(meta: dict, outputs: set[str],
+                                  checker: torch.Tensor,
+                                  logits: torch.Tensor) -> dict[str, np.ndarray]:
+    """Return direct PNG-ready uint16 frames using the normal sRGB render path."""
+    rendered = _render_predictions_torch(meta, outputs, checker, logits)
+    # Alpha matte is stored as a true single-channel grayscale PNG. Its values
+    # are exactly the same 16-bit matte values as the three-channel video path.
+    if "alpha" in rendered:
+        rendered["alpha"] = np.ascontiguousarray(rendered["alpha"][..., :1])
+    return rendered
+
+
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
                   hint_video_path: str | None):
@@ -738,9 +752,13 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     cfg.temp_dir.mkdir(parents=True, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
     is_dir = os.path.isdir(input_path)
-    reader_kind = "frame_dir" if is_dir else "video"
-    reader_cls = SequentialFrameDirWindowReader if is_dir else SequentialVideoWindowReader
-    if is_dir:
+    input_suffix = Path(input_path).suffix.lower()
+    is_still = (os.path.isfile(input_path) and input_suffix in
+                {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"})
+    is_frame_input = is_dir or is_still
+    reader_kind = "frame_dir" if is_frame_input else "video"
+    reader_cls = SequentialFrameDirWindowReader if is_frame_input else SequentialVideoWindowReader
+    if is_frame_input:
         meta = probe_frame_dir_meta(
             input_path, num_frames=cfg.num_frames,
             shape_quantum=cfg.shape_quantum, fps=cfg.frame_dir_fps,
@@ -780,17 +798,37 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     }
     try:
         use_exr = cfg.output_format == "exr"
-        if cfg.output_format not in ("video", "exr"):
+        use_png = cfg.output_format == "png"
+        if cfg.output_format not in ("video", "exr", "png"):
             raise ValueError(f"unsupported output format: {cfg.output_format}")
         for name in sorted(cfg.outputs):
             if name not in suffix:
                 raise ValueError(f"unsupported output choice: {name}")
             if use_exr:
                 channels = 4 if name == "cutout" else (1 if name == "alpha" else 3)
+                output_labels = {
+                    "alpha": "Alpha Matte",
+                    "fg": "FG",
+                    "checker": f"Checker - Despill {int(cfg.despill_strength * 100):03d}",
+                    "cutout": "Cutout",
+                }
                 writers[name] = ExrSequenceWriter(
                     os.path.join(output_dir, f"{clip_name}_{suffix[name]}_exr"),
                     fps, (W_out, H_out), channels=channels,
-                    dtype=cfg.exr_dtype, frame_name=suffix[name])
+                    dtype=cfg.exr_dtype, compression=cfg.exr_compression,
+                    frame_name=f"{clip_name} - {output_labels[name]}")
+            elif use_png:
+                channels = 1 if name == "alpha" else (4 if name == "cutout" else 3)
+                output_labels = {
+                    "alpha": "Alpha Matte",
+                    "fg": "FG",
+                    "checker": f"Checker - Despill {int(cfg.despill_strength * 100):03d}",
+                    "cutout": "Cutout",
+                }
+                writers[name] = PngSequenceWriter(
+                    os.path.join(output_dir, f"{clip_name}_{suffix[name]}_png"),
+                    fps, (W_out, H_out), channels=channels,
+                    frame_name=f"{clip_name} - {output_labels[name]}")
             else:
                 ext = ".mov" if name == "cutout" else ".mp4"
                 channels = 4 if name == "cutout" else 3
@@ -813,6 +851,10 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 sf.write(f"Output Format: {cfg.output_format}\n")
                 if cfg.output_format == "exr":
                     sf.write(f"EXR Pixel Type: {cfg.exr_dtype}\n")
+                    sf.write(f"EXR Compression: {cfg.exr_compression}\n")
+                elif cfg.output_format == "png":
+                    sf.write("PNG Bit Depth: 16-bit\n")
+                    sf.write("PNG Writer: Direct (no EXR staging)\n")
                 sf.write(f"Hint First Frame: {initial_hint_path}\n")
                 sf.write(f"Hint Video: {hint_video_path}\n")
                 sf.write(f"Hint Quality (Trust): {cfg.hint_quality}\n")
@@ -887,8 +929,9 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                     logits = model.stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
-                render_fn = (_render_predictions_exr_torch if use_exr
-                             else _render_predictions_torch)
+                render_fn = (_render_predictions_exr_torch if use_exr else
+                             _render_predictions_png_torch if use_png else
+                             _render_predictions_torch)
                 rendered = render_fn(meta, cfg.outputs, checker_t, logits[0])
                 for name, frames in rendered.items():
                     writers[name].write_many(frames)
@@ -933,5 +976,5 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
         torch.cuda.empty_cache()
-    print(f"  wrote {len(writers)} output video(s) for {clip_name} "
+    print(f"  wrote {len(writers)} {cfg.output_format} output(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
+from fractions import Fraction
 import queue
 import shutil
 import subprocess
@@ -16,7 +18,42 @@ import cv2
 import numpy as np
 import torch
 
+try:
+    import OpenEXR  # OpenEXR>=3.3; required for valid DWAA / DWAB writing
+except Exception:  # regular compression remains available through OpenCV
+    OpenEXR = None
+
 from . import color_utils as cu
+
+
+def _write_openexr_dwa(path: str, frame: np.ndarray, *, dtype: str, compression: str) -> None:
+    """Write one HxW, HxWx3 BGR, or HxWx4 BGRA float frame using OpenEXR DWA."""
+    if OpenEXR is None or not hasattr(OpenEXR, "File"):
+        raise RuntimeError(
+            f"EXR compression {compression} requires OpenEXR>=3.3. "
+            "Install it with `python -m pip install OpenEXR`."
+        )
+    enum_name = f"{compression}_COMPRESSION"
+    if not hasattr(OpenEXR, enum_name):
+        raise RuntimeError(f"Installed OpenEXR package does not support {compression} compression")
+    pixels = np.asarray(frame)
+    cast = np.float16 if dtype == "half" else np.float32
+    pixels = np.ascontiguousarray(pixels.astype(cast, copy=False))
+    if pixels.ndim == 2:
+        channels = {"Y": pixels}
+    elif pixels.ndim == 3 and pixels.shape[-1] == 1:
+        channels = {"Y": pixels[..., 0]}
+    elif pixels.ndim == 3 and pixels.shape[-1] == 3:
+        # Writer receives BGR data to stay consistent with OpenCV convention.
+        channels = {"B": pixels[..., 0], "G": pixels[..., 1], "R": pixels[..., 2]}
+    elif pixels.ndim == 3 and pixels.shape[-1] == 4:
+        channels = {"B": pixels[..., 0], "G": pixels[..., 1],
+                    "R": pixels[..., 2], "A": pixels[..., 3]}
+    else:
+        raise ValueError(f"Unsupported EXR frame shape for {compression}: {pixels.shape}")
+    header = {"compression": getattr(OpenEXR, enum_name), "type": OpenEXR.scanlineimage}
+    with OpenEXR.File(header, channels) as exr_file:
+        exr_file.write(path)
 
 
 @dataclass
@@ -30,11 +67,276 @@ class WriterConfig:
     threads: int = 2
 
 
+_CORRIDORKEY_FFMPEG_BIN = "ffmpeg"
+
+
+def _resolve_tool(binary: str) -> str | None:
+    """Resolve a multimedia executable, including a sibling of a configured FFmpeg."""
+    value = str(binary or "").strip().strip('"')
+    if not value:
+        return None
+    found = shutil.which(value)
+    if found:
+        return str(Path(found).resolve())
+    candidate = Path(value).expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve())
+    return None
+
+
+def _ffprobe_binary() -> str | None:
+    ffmpeg_path = _resolve_tool(_CORRIDORKEY_FFMPEG_BIN)
+    if ffmpeg_path:
+        sibling = Path(ffmpeg_path).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if sibling.is_file():
+            return str(sibling.resolve())
+    return _resolve_tool("ffprobe")
+
+
+def _probe_video_with_ffprobe(video_path: str) -> dict:
+    """Read video stream metadata without relying on OpenCV's bundled FFmpeg."""
+    ffprobe = _ffprobe_binary()
+    if not ffprobe:
+        raise FileNotFoundError(
+            "ffprobe was not found. Install the FFmpeg full build (ffmpeg.exe and ffprobe.exe together), "
+            "or add its bin folder to PATH.")
+    source = Path(video_path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"Input video does not exist: {source}")
+    command = [
+        ffprobe, "-v", "error", "-select_streams", "v:0",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+        "-of", "json", str(source),
+    ]
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60,
+                            creationflags=flags, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "ffprobe returned no details").strip()
+        raise RuntimeError(f"FFmpeg could not inspect the input video:\n{detail}")
+    try:
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams") or []
+        if not streams:
+            raise ValueError("No video stream was found")
+        stream = streams[0]
+        width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+        if width <= 0 or height <= 0:
+            raise ValueError("The video stream has invalid dimensions")
+
+        fps_text = str(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1")
+        try:
+            fps = float(Fraction(fps_text))
+        except (ValueError, ZeroDivisionError, TypeError):
+            fps = 0.0
+        if not math.isfinite(fps) or fps <= 0:
+            fps_text = str(stream.get("r_frame_rate") or "24/1")
+            try:
+                fps = float(Fraction(fps_text))
+            except (ValueError, ZeroDivisionError, TypeError):
+                fps = 24.0
+
+        count = 0
+        raw_count = stream.get("nb_frames")
+        if raw_count not in (None, "N/A", ""):
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                count = 0
+        duration = stream.get("duration")
+        if duration in (None, "N/A", ""):
+            duration = (payload.get("format") or {}).get("duration")
+        try:
+            duration_value = float(duration) if duration not in (None, "N/A", "") else 0.0
+        except (TypeError, ValueError):
+            duration_value = 0.0
+        if count <= 0 and duration_value > 0 and fps > 0:
+            count = max(1, int(round(duration_value * fps)))
+        if count <= 0:
+            # Rare containers omit both nb_frames and duration. Count only in this
+            # fallback case, avoiding an unnecessary full preliminary decode for MP4/MOV.
+            count_command = [
+                ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=nb_read_frames", "-of", "json", str(source),
+            ]
+            counted = subprocess.run(count_command, capture_output=True, text=True,
+                                     timeout=300, creationflags=flags, check=False)
+            if counted.returncode == 0:
+                streams_counted = (json.loads(counted.stdout).get("streams") or [])
+                if streams_counted:
+                    try:
+                        count = int(streams_counted[0].get("nb_read_frames") or 0)
+                    except (TypeError, ValueError):
+                        count = 0
+        if count <= 0:
+            raise ValueError("Could not determine the video frame count")
+        return {"width": width, "height": height, "fps": fps, "frame_count": count}
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read video metadata for {source}: {exc}") from exc
+
+
+class FFmpegVideoCapture:
+    """OpenCV-compatible sequential reader backed by the system FFmpeg executable.
+
+    This is used when OpenCV's own VideoCapture backend cannot initialise the
+    Windows video decoder. Frames are streamed as BGR24, matching cv2.VideoCapture.
+    """
+    def __init__(self, video_path: str, start_frame: int = 0):
+        self.video_path = str(Path(video_path).expanduser())
+        self.meta = _probe_video_with_ffprobe(self.video_path)
+        self.width = int(self.meta["width"])
+        self.height = int(self.meta["height"])
+        self.fps = float(self.meta["fps"])
+        self.frame_count = int(self.meta["frame_count"])
+        self.start_frame = max(0, int(start_frame))
+        self.position = 0
+        self.process = None
+        self._prefetched_frame = None
+        self._start()
+        # Validate that the source really decodes before handing the reader to
+        # the model. If it does not, open_video_capture can still try OpenCV.
+        first = self._read_raw_frame()
+        if first is None:
+            self.release()
+            raise RuntimeError(f"FFmpeg could not decode the first frame of {self.video_path}")
+        self._prefetched_frame = first
+
+    def _start(self) -> None:
+        ffmpeg = _resolve_tool(_CORRIDORKEY_FFMPEG_BIN)
+        if not ffmpeg:
+            raise FileNotFoundError(f"FFmpeg executable not found: {_CORRIDORKEY_FFMPEG_BIN}")
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                   "-i", self.video_path, "-map", "0:v:0", "-an", "-sn", "-dn"]
+        if self.start_frame > 0:
+            # select operates on decoded frame numbers, so frame-index seeking remains
+            # exact even for clips whose timestamps are not perfectly CFR.
+            command += ["-vf", f"select=gte(n\\,{self.start_frame})"]
+        command += ["-vsync", "0", "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        self.process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, bufsize=2 ** 20, creationflags=flags)
+        # Do not reject a very short clip merely because FFmpeg has already
+        # finished writing its frames into the pipe buffer.
+
+    def isOpened(self) -> bool:
+        return self.process is not None
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self.width)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self.height)
+        if prop == cv2.CAP_PROP_FPS:
+            return float(self.fps)
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(self.frame_count)
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return float(self.start_frame + self.position)
+        return 0.0
+
+    def set(self, prop: int, value: float) -> bool:
+        if prop != cv2.CAP_PROP_POS_FRAMES:
+            return False
+        target = max(0, min(int(round(float(value))), max(0, self.frame_count - 1)))
+        if target == self.start_frame and self.position == 0:
+            return True
+        self.release()
+        self.start_frame = target
+        self.position = 0
+        self._prefetched_frame = None
+        self._start()
+        first = self._read_raw_frame()
+        if first is None:
+            self.release()
+            return False
+        self._prefetched_frame = first
+        return True
+
+    def _read_raw_frame(self):
+        if self.process is None or self.process.stdout is None:
+            return None
+        frame_bytes = self.width * self.height * 3
+        data = bytearray()
+        try:
+            while len(data) < frame_bytes:
+                chunk = self.process.stdout.read(frame_bytes - len(data))
+                if not chunk:
+                    return None
+                data.extend(chunk)
+            return np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 3).copy()
+        except (OSError, ValueError):
+            return None
+
+    def read(self):
+        if self.process is None:
+            return False, None
+        if self._prefetched_frame is not None:
+            frame = self._prefetched_frame
+            self._prefetched_frame = None
+        else:
+            frame = self._read_raw_frame()
+            if frame is None:
+                return False, None
+        self.position += 1
+        return True, frame
+
+    def release(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        try:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def open_video_capture(video_path: str):
+    """Prefer FFmpeg CLI decoding; fall back to OpenCV only if FFmpeg tools are absent."""
+    ffmpeg = _resolve_tool(_CORRIDORKEY_FFMPEG_BIN)
+    ffprobe = _ffprobe_binary()
+    if ffmpeg and ffprobe:
+        try:
+            return FFmpegVideoCapture(video_path)
+        except Exception as ffmpeg_exc:
+            # OpenCV remains a compatibility fallback for unusual containers when
+            # system FFmpeg metadata probing cannot read the clip.
+            cv_cap = cv2.VideoCapture(str(video_path))
+            if cv_cap.isOpened():
+                return cv_cap
+            cv_cap.release()
+            raise RuntimeError(
+                f"Could not open video: {video_path}\n"
+                f"FFmpeg reader: {ffmpeg_exc}\n"
+                "OpenCV VideoCapture could not open it either. Check that the file is a "
+                "valid video and that its codec is supported by your FFmpeg build.") from ffmpeg_exc
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(
+            f"Could not open video: {video_path}. Install the FFmpeg full build "
+            "(ffmpeg.exe + ffprobe.exe) or use a supported video codec.")
+    return cap
+
+
 def require_ffmpeg(ffmpeg_bin: str) -> None:
-    if shutil.which(ffmpeg_bin) is None:
+    global _CORRIDORKEY_FFMPEG_BIN
+    resolved = _resolve_tool(ffmpeg_bin)
+    if not resolved:
         raise FileNotFoundError(
             f"ffmpeg binary not found: {ffmpeg_bin}. "
             "Install ffmpeg or pass --ffmpeg_bin.")
+    _CORRIDORKEY_FFMPEG_BIN = resolved
 
 
 def safe_remove(path: str | os.PathLike | None) -> None:
@@ -63,11 +365,25 @@ def raw_clip_name(path: str | os.PathLike) -> str:
     return name
 
 
+_IMAGE_FRAME_EXTENSIONS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
 def frame_paths(frame_dir: str | os.PathLike) -> list[str]:
+    """Return ordered image frames, accepting either a folder or one still image.
+
+    CorridorKey uses the frame-directory reader for both image sequences and
+    single still inputs. A still path must therefore be returned as a one-item
+    frame list rather than being globbed as though it were a directory.
+    """
+    source = Path(frame_dir).expanduser()
+    if source.is_file():
+        return [str(source.resolve())] if source.suffix.lower() in _IMAGE_FRAME_EXTENSIONS else []
+    if not source.is_dir():
+        return []
     paths: list[str] = []
-    for ext in ("*.exr", "*.png", "*.jpg", "*.jpeg"):
-        paths.extend(glob.glob(os.path.join(str(frame_dir), ext)))
-    return sorted(paths)
+    for pattern in ("*.exr", "*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp"):
+        paths.extend(glob.glob(str(source / pattern)))
+    return sorted(paths, key=lambda item: (Path(item).name.casefold(), item))
 
 
 def ceil_to_multiple(x: int, q: int) -> int:
@@ -124,21 +440,34 @@ def crop_model_chw_to_output(x: np.ndarray, model_native_hw, pad, output_hw):
 
 
 def read_image_rgb(path: str | os.PathLike):
+    """Read EXR or display-coded stills as RGB float32 without bit-depth loss."""
     path = str(path)
-    if path.lower().endswith(".exr"):
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise FileNotFoundError(path)
-        img = img.astype(np.float32, copy=False)
-        if img.ndim == 3 and img.shape[2] == 4:
-            img = img[:, :, :3]
-        if img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return img
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
-        raise FileNotFoundError(path)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        raise FileNotFoundError(f"Could not read image frame: {path}")
+
+    is_exr = Path(path).suffix.lower() == ".exr"
+    if is_exr:
+        # EXR values are already scene-linear float values; do not normalize.
+        img = img.astype(np.float32, copy=False)
+    elif img.dtype == np.uint8:
+        img = img.astype(np.float32) / 255.0
+    elif img.dtype == np.uint16:
+        img = img.astype(np.float32) / 65535.0
+    else:
+        img = img.astype(np.float32, copy=False)
+
+    # Normalize image channel layouts to RGB; input alpha is not used by the
+    # matting model, while output Cutout alpha remains fully preserved.
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+    elif img.ndim == 3 and img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    elif img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(f"Unsupported image channel layout {img.shape} in {path}")
+    return img
 
 
 def read_hint_image(path: str | os.PathLike) -> np.ndarray:
@@ -186,14 +515,21 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
                      model_scale: float, linear_brightness: float,
                      linear_contrast: float,
                      linear_contrast_pivot: float) -> dict:
-    cap = cv2.VideoCapture(video_path)
+    cap = open_video_capture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
-    native_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    w_native = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h_native = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    try:
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        w_native = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h_native = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        cap.release()
+    if w_native <= 0 or h_native <= 0 or n_total <= 0:
+        raise RuntimeError(
+            f"Video metadata is incomplete for {video_path}: "
+            f"{w_native}x{h_native}, {n_total} frames, {native_fps} fps. "
+            "Check the file with FFmpeg or transcode it to H.264 MP4.")
 
     q = int(shape_quantum)
     if native_resolution:
@@ -342,7 +678,7 @@ class SequentialVideoWindowReader:
     def __init__(self, video_path: str, meta: dict):
         self.video_path = video_path
         self.meta = meta
-        self.cap = cv2.VideoCapture(video_path)
+        self.cap = open_video_capture(video_path)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
         self.start_frame = int(meta["start_frame"])
@@ -405,7 +741,7 @@ class SequentialFrameDirWindowReader:
 
 def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
                             need_model: bool):
-    cap = cv2.VideoCapture(video_path)
+    cap = open_video_capture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
     if int(meta["start_frame"]):
@@ -503,7 +839,7 @@ class SequentialHintVideoWindowReader:
     def __init__(self, hint_video_path: str, meta: dict):
         self.hint_video_path = hint_video_path
         self.meta = meta
-        self.cap = cv2.VideoCapture(hint_video_path)
+        self.cap = open_video_capture(hint_video_path)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open hint video: {hint_video_path}")
         self.start_frame = int(meta["start_frame"])
@@ -700,6 +1036,81 @@ class ThreadedVideoWriter:
             raise self.err
 
 
+class PngSequenceWriter:
+    """Write inference frames directly as lossless 16-bit PNG image sequences.
+
+    Input arrays use the same channel convention and already-display-referred
+    pixel values as CorridorKey's normal video renderer: uint16 BGR, grayscale
+    alpha, or BGRA for cutout. No EXR staging, color transform, or quantization
+    pass is performed here.
+    """
+
+    def __init__(self, dir_path: str, fps: float, size: tuple[int, int], *,
+                 channels: int = 3, maxsize: int = 2, frame_name: str = "frame"):
+        if channels not in (1, 3, 4):
+            raise ValueError(f"PNG writer supports 1, 3, or 4 channels, got {channels}")
+        self.dir_path = str(dir_path)
+        self.path = self.dir_path
+        self.fps = float(fps)
+        self.size = size
+        self.channels = channels
+        self.frame_name = frame_name
+        # Match normal render overwrite behaviour while preventing stale frames
+        # from a longer previous sequence from remaining in the new output.
+        if os.path.isdir(self.dir_path):
+            shutil.rmtree(self.dir_path)
+        os.makedirs(self.dir_path, exist_ok=True)
+        self.frame_idx = 0
+        self.q = queue.Queue(maxsize=maxsize)
+        self.err = None
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        while True:
+            item = self.q.get()
+            try:
+                if item is None:
+                    return
+                # After the first write error, keep draining the queue so the
+                # producer can finish and release() cannot deadlock.
+                if self.err is None:
+                    idx0, arr = item
+                    for j in range(arr.shape[0]):
+                        frame = np.ascontiguousarray(arr[j])
+                        if self.channels == 1:
+                            frame = frame[..., 0]
+                        out_path = os.path.join(
+                            self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.png")
+                        if not cv2.imwrite(out_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
+                            raise RuntimeError(f"PNG writer failed: {out_path}")
+            except Exception as exc:
+                self.err = exc
+            finally:
+                self.q.task_done()
+
+    def write_many(self, frames: np.ndarray):
+        if self.err is not None:
+            raise self.err
+        arr = np.ascontiguousarray(frames)
+        if arr.ndim != 4 or arr.shape[-1] != self.channels:
+            raise ValueError(
+                f"expected batched frames as NHWC uint16 with {self.channels} channels, got {arr.shape}")
+        if arr.dtype != np.uint16:
+            raise ValueError(f"expected uint16 PNG frames, got {arr.dtype}")
+        self.q.put((self.frame_idx, arr))
+        self.frame_idx += arr.shape[0]
+
+    def write(self, frame: np.ndarray):
+        self.write_many(frame[None])
+
+    def release(self):
+        self.q.put(None)
+        self.thread.join()
+        if self.err is not None:
+            raise self.err
+
+
 class ExrSequenceWriter:
     """Writes float frames as an OpenEXR image sequence (scene-referred, unclamped).
 
@@ -710,22 +1121,45 @@ class ExrSequenceWriter:
     """
 
     def __init__(self, dir_path: str, fps: float, size: tuple[int, int], *,
-                 channels: int = 3, dtype: str = "half", maxsize: int = 2,
+                 channels: int = 3, dtype: str = "half", compression: str = "ZIP", maxsize: int = 2,
                  frame_name: str = "frame"):
         if dtype not in ("half", "float"):
             raise ValueError(f"exr dtype must be 'half' or 'float', got {dtype!r}")
+        compression_map = {
+            "ZIP": "IMWRITE_EXR_COMPRESSION_ZIP", "PIZ": "IMWRITE_EXR_COMPRESSION_PIZ",
+            "RLE": "IMWRITE_EXR_COMPRESSION_RLE", "ZIPS": "IMWRITE_EXR_COMPRESSION_ZIPS",
+            "PXR24": "IMWRITE_EXR_COMPRESSION_PXR24", "B44": "IMWRITE_EXR_COMPRESSION_B44",
+            "B44A": "IMWRITE_EXR_COMPRESSION_B44A", "DWAA": "IMWRITE_EXR_COMPRESSION_DWAA",
+            "DWAB": "IMWRITE_EXR_COMPRESSION_DWAB", "NONE": "IMWRITE_EXR_COMPRESSION_NO"}
+        if compression not in compression_map:
+            raise ValueError(f"unsupported EXR compression: {compression!r}")
+        compression_attr = compression_map[compression]
+        self.compression = compression
+        if compression in ("DWAA", "DWAB"):
+            if OpenEXR is None or not hasattr(OpenEXR, "File"):
+                raise RuntimeError(
+                    f"EXR compression {compression} requires OpenEXR>=3.3. "
+                    "Install it with `python -m pip install OpenEXR`."
+                )
+            if not hasattr(OpenEXR, f"{compression}_COMPRESSION"):
+                raise ValueError(f"Installed OpenEXR package does not support {compression}")
+        elif not hasattr(cv2, compression_attr):
+            raise ValueError(f"OpenCV build does not support EXR compression {compression}")
         self.dir_path = str(dir_path)
         self.path = self.dir_path  # for logging parity with ThreadedVideoWriter
         self.size = size
         self.channels = channels
         self.frame_name = frame_name
-        exr_type = (cv2.IMWRITE_EXR_TYPE_HALF if dtype == "half"
-                    else cv2.IMWRITE_EXR_TYPE_FLOAT)
         self.clamp_half = dtype == "half"
-        self.imwrite_params = [
-            cv2.IMWRITE_EXR_TYPE, exr_type,
-            cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_ZIP,
-        ]
+        if compression in ("DWAA", "DWAB"):
+            self.imwrite_params = None
+        else:
+            exr_type = (cv2.IMWRITE_EXR_TYPE_HALF if dtype == "half"
+                        else cv2.IMWRITE_EXR_TYPE_FLOAT)
+            self.imwrite_params = [
+                cv2.IMWRITE_EXR_TYPE, exr_type,
+                cv2.IMWRITE_EXR_COMPRESSION, getattr(cv2, compression_attr),
+            ]
         os.makedirs(self.dir_path, exist_ok=True)
         self.frame_idx = 0
         self.q = queue.Queue(maxsize=maxsize)
@@ -750,7 +1184,10 @@ class ExrSequenceWriter:
                     frame = np.ascontiguousarray(arr[j])
                     if frame.shape[-1] == 1:
                         frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
+                    if self.compression in ("DWAA", "DWAB"):
+                        _write_openexr_dwa(out_path, frame, dtype="half" if self.clamp_half else "float",
+                                           compression=self.compression)
+                    elif not cv2.imwrite(out_path, frame, self.imwrite_params):
                         raise RuntimeError(f"cv2.imwrite failed: {out_path}")
                 self.q.task_done()
         except Exception as exc:
