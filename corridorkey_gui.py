@@ -1161,7 +1161,42 @@ def pil_font(px: int, bold: bool = False):
         return ImageFont.load_default()
 
 
+def _strip_png_iccp_profile(payload: bytes) -> bytes:
+    """Remove embedded iCCP metadata from decorative UI PNGs, preserving pixels.
+
+    Some copies of the optional Omnitrix artwork carry a malformed/known-bad
+    sRGB ICC profile. libpng reports this as ``iCCP: known incorrect sRGB
+    profile`` during startup. The iCCP chunk is ancillary metadata; removing
+    it leaves IDAT image data and all decoded pixel values unchanged. This
+    helper is used only for the optional UI artwork, never source footage or
+    rendered outputs.
+    """
+    data = bytes(payload or b"")
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not data.startswith(signature):
+        return data
+    out = bytearray(signature)
+    pos = len(signature)
+    removed = False
+    while pos + 12 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        end = pos + 12 + length
+        if end > len(data):
+            # Leave malformed/non-standard files untouched for Pillow to report.
+            return data
+        chunk_type = data[pos + 4:pos + 8]
+        if chunk_type == b"iCCP":
+            removed = True
+        else:
+            out.extend(data[pos:end])
+        pos = end
+        if chunk_type == b"IEND":
+            break
+    return bytes(out) if removed else data
+
+
 def load_logo() -> Image.Image:
+    # The embedded CorridorKey brand mark is already a clean, profile-free PNG.
     return Image.open(io.BytesIO(base64.b64decode(_LOGO_B64))).convert("RGBA")
 
 
@@ -4568,6 +4603,9 @@ class App(ctk.CTk):
         if self.v_input.get().strip():
             self.after(220, self._restore_preview_on_startup)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # The first-run tour opens only after the launcher checks and application
+        # startup have completed. Its completion state is stored in preferences.
+        self.after(1400, self._show_first_run_tour_if_needed)
 
     # ------------------------------------------------------------ window bits
     def _scale(self) -> float:
@@ -4674,7 +4712,10 @@ class App(ctk.CTk):
         """Load the project-local Omnitrix image, otherwise use the vector fallback."""
         try:
             if self._omnitrix_asset_path.is_file():
-                with Image.open(self._omnitrix_asset_path) as loaded:
+                # Normalize only the decorative UI artwork. Never rewrite or
+                # colour-transform user footage, previews, or render outputs.
+                payload = _strip_png_iccp_profile(self._omnitrix_asset_path.read_bytes())
+                with Image.open(io.BytesIO(payload)) as loaded:
                     loaded.load()
                     return ImageOps.fit(
                         loaded.convert("RGBA"), (512, 512), method=Image.LANCZOS)
@@ -4711,6 +4752,10 @@ class App(ctk.CTk):
                 payload = response.read(4 * 1024 * 1024 + 1)
             if not payload or len(payload) > 4 * 1024 * 1024:
                 raise ValueError("Omnitrix image download was empty or exceeded 4 MB.")
+            # Wikimedia's artwork can include an invalid iCCP profile. Drop
+            # that profile before libpng decodes it; decoded pixel values are
+            # unchanged and the normalized copy is what the project stores.
+            payload = _strip_png_iccp_profile(payload)
             with Image.open(io.BytesIO(payload)) as downloaded:
                 downloaded.load()
                 image = ImageOps.fit(
@@ -5587,13 +5632,15 @@ class App(ctk.CTk):
         self.omnitrix_next_button = None
         self.omnitrix_count_label = None
         self.omnitrix_media_label = None
+        self.b_quick_tour = self._pill(head, "Quick Tour", self._show_feature_tour, 86)
+        self.b_quick_tour.grid(row=0, column=6, padx=(0, 7), sticky="e")
         self.b_preferences = self._pill(head, "⚙ Preferences", self._open_preferences, 116)
-        self.b_preferences.grid(row=0, column=6, padx=(0, 8), sticky="e")
+        self.b_preferences.grid(row=0, column=7, padx=(0, 8), sticky="e")
         self.b_factory_reset = self._pill(head, "Factory Reset", self._factory_reset, 106)
         self.b_factory_reset.configure(text_color=RED)
-        self.b_factory_reset.grid(row=0, column=7, padx=(0, 12), sticky="e")
+        self.b_factory_reset.grid(row=0, column=8, padx=(0, 12), sticky="e")
         stat = ctk.CTkFrame(head, fg_color="transparent")
-        stat.grid(row=0, column=8, padx=(4, 22), sticky="e")
+        stat.grid(row=0, column=9, padx=(4, 22), sticky="e")
         self.l_dot = ctk.CTkLabel(stat, text="\u25CF", font=ctk.CTkFont(size=13), text_color=ACCENT)
         self.l_dot.pack(side="left", padx=(0, 6))
         self.l_status = ctk.CTkLabel(stat, text="Ready", font=self.f_body, text_color=SUBTLE)
@@ -5955,13 +6002,15 @@ class App(ctk.CTk):
         self.omnitrix_next_button = None
         self.omnitrix_count_label = None
         self.omnitrix_media_label = None
+        self.b_quick_tour = self._pill(head, "Quick Tour", self._show_feature_tour, 86)
+        self.b_quick_tour.grid(row=0, column=6, padx=(0, 7), sticky="e")
         self.b_preferences = self._pill(head, "⚙ Preferences", self._open_preferences, 116)
-        self.b_preferences.grid(row=0, column=6, padx=(0, 8), sticky="e")
+        self.b_preferences.grid(row=0, column=7, padx=(0, 8), sticky="e")
         self.b_factory_reset = self._pill(head, "Factory Reset", self._factory_reset, 106)
         self.b_factory_reset.configure(text_color=RED)
-        self.b_factory_reset.grid(row=0, column=7, padx=(0, 12), sticky="e")
+        self.b_factory_reset.grid(row=0, column=8, padx=(0, 12), sticky="e")
         stat = ctk.CTkFrame(head, fg_color="transparent")
-        stat.grid(row=0, column=8, padx=(4, 22), sticky="e")
+        stat.grid(row=0, column=9, padx=(4, 22), sticky="e")
         self.l_dot = ctk.CTkLabel(stat, text="\u25CF", font=ctk.CTkFont(size=13), text_color=SUBTLE)
         self.l_dot.pack(side="left", padx=(0, 6))
         self.l_status = ctk.CTkLabel(stat, text="Ready", font=self.f_body, text_color=SUBTLE)
@@ -6330,13 +6379,15 @@ class App(ctk.CTk):
         self.omnitrix_next_button = None
         self.omnitrix_count_label = None
         self.omnitrix_media_label = None
+        self.b_quick_tour = self._pill(head, "Quick Tour", self._show_feature_tour, 86)
+        self.b_quick_tour.grid(row=0, column=6, padx=(0, 7), sticky="e")
         self.b_preferences = self._pill(head, "⚙ Preferences", self._open_preferences, 116)
-        self.b_preferences.grid(row=0, column=6, padx=(0, 8), sticky="e")
+        self.b_preferences.grid(row=0, column=7, padx=(0, 8), sticky="e")
         self.b_factory_reset = self._pill(head, "Factory Reset", self._factory_reset, 106)
         self.b_factory_reset.configure(text_color=RED)
-        self.b_factory_reset.grid(row=0, column=7, padx=(0, 12), sticky="e")
+        self.b_factory_reset.grid(row=0, column=8, padx=(0, 12), sticky="e")
         stat = ctk.CTkFrame(head, fg_color="transparent")
-        stat.grid(row=0, column=8, padx=(4, 22), sticky="e")
+        stat.grid(row=0, column=9, padx=(4, 22), sticky="e")
         self.l_dot = ctk.CTkLabel(stat, text="\u25CF", font=ctk.CTkFont(size=13), text_color=ACCENT)
         self.l_dot.pack(side="left", padx=(0, 6))
         self.l_status = ctk.CTkLabel(stat, text="Ready", font=self.f_body, text_color=SUBTLE)
@@ -6861,13 +6912,15 @@ class App(ctk.CTk):
         self.omnitrix_next_button = None
         self.omnitrix_count_label = None
         self.omnitrix_media_label = None
+        self.b_quick_tour = self._pill(head, "Quick Tour", self._show_feature_tour, 86)
+        self.b_quick_tour.grid(row=0, column=4, padx=(0, 7), sticky="e")
         self.b_preferences = self._pill(head, "⚙ Preferences", self._open_preferences, 116)
-        self.b_preferences.grid(row=0, column=4, padx=(0, 8), sticky="e")
+        self.b_preferences.grid(row=0, column=5, padx=(0, 8), sticky="e")
         self.b_factory_reset = self._pill(head, "Factory Reset", self._factory_reset, 106)
         self.b_factory_reset.configure(text_color=RED)
-        self.b_factory_reset.grid(row=0, column=5, padx=(0, 12), sticky="e")
+        self.b_factory_reset.grid(row=0, column=6, padx=(0, 12), sticky="e")
         stat = ctk.CTkFrame(head, fg_color="transparent")
-        stat.grid(row=0, column=6, padx=(4, 22), sticky="e")
+        stat.grid(row=0, column=7, padx=(4, 22), sticky="e")
         self.l_dot = ctk.CTkLabel(stat, text="\u25CF", font=ctk.CTkFont(size=13), text_color=SUBTLE)
         self.l_dot.pack(side="left", padx=(0, 6))
         self.l_status = ctk.CTkLabel(stat, text="Ready", font=self.f_body, text_color=SUBTLE)
@@ -7832,6 +7885,277 @@ class App(ctk.CTk):
         self._update_fullscreen_preview()
         self._update_detached_preview()
 
+    def _show_first_run_tour_if_needed(self) -> None:
+        """Show the welcome guide once, after a successful first GUI launch."""
+        if getattr(self, "_closing", False):
+            return
+        if not bool(self._preferences.get("first_run_tour_completed", False)):
+            self._show_feature_tour(first_run=True)
+
+    def _finish_feature_tour(self) -> None:
+        self._preferences["first_run_tour_completed"] = True
+        self._save_preferences_file()
+        self._close_feature_tour()
+
+    def _close_feature_tour(self) -> None:
+        win = getattr(self, "_feature_tour_window", None)
+        self._feature_tour_window = None
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.grab_release()
+                    win.destroy()
+            except Exception:
+                pass
+
+    def _show_feature_tour(self, first_run: bool = False) -> None:
+        """Open a short guided walkthrough of the main CorridorKey workflow."""
+        existing = getattr(self, "_feature_tour_window", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+
+        steps = [
+            {
+                "eyebrow": "WELCOME",
+                "title": "Welcome to CorridorKey 2.0",
+                "body": "Your local VFX keying workspace. This quick tour walks through the normal path from footage to finished outputs. Your clips, models and renders stay in your project on this PC.",
+                "items": [
+                    "Import footage into the Media library.",
+                    "Choose a clip and prepare its keying settings.",
+                    "Review the preview, then render one clip or a queue.",
+                ],
+                "tip": "You can reopen this guide anytime using Quick Tour in the top bar.",
+                "page": None,
+            },
+            {
+                "eyebrow": "01 · MEDIA",
+                "title": "1. Bring in your footage",
+                "body": "Use the Media tab to build your clip library. Import Files and Import Folder are available in Classic and Queue Studio; switch workspaces from the bottom dock if you need the full media library.",
+                "items": [
+                    "Use Import Files or Import Folder to choose clips and image sequences.",
+                    "Select a clip to load it into the active workflow.",
+                    "Keep source footage in its original location; CorridorKey reads it from there.",
+                ],
+                "tip": "Start with a short test clip while learning the settings.",
+                "page": "Media",
+            },
+            {
+                "eyebrow": "02 · SETUP",
+                "title": "2. Prepare the key",
+                "body": "In Setup, choose your input and select the hint mode that matches the shot. No Hint is useful for a quick test; First Frame or Video Hint can guide difficult subjects and changing shots.",
+                "items": [
+                    "Choose the output channels you need: Alpha, FG, Checker or Cutout.",
+                    "Adjust despill and other render settings only as needed.",
+                    "Create Hint Mask opens the optional PhotoCraft editor when you need to paint a matte.",
+                ],
+                "tip": "For a first test, keep the default settings and render a short range.",
+                "page": "Setup",
+            },
+            {
+                "eyebrow": "03 · PREVIEW",
+                "title": "3. Check the result before rendering",
+                "body": "Use the preview to inspect the input and generated result. Compare views, play through motion, and check edges on more than one frame before committing to a longer render.",
+                "items": [
+                    "Use the preview tabs to switch between Input and available result channels.",
+                    "Use playback and frame stepping to inspect motion and edge stability.",
+                    "Use the preview background controls to judge transparency and fine hair edges.",
+                ],
+                "tip": "A clean first frame does not guarantee a clean shot—scrub through the clip.",
+                "page": "Setup",
+            },
+            {
+                "eyebrow": "04 · QUEUE",
+                "title": "4. Render one clip or a batch",
+                "body": "Add clips to the render queue when you want to process several shots. Queue Studio keeps queue controls in Setup; Classic also has a dedicated Queue tab. Use Run Queue to process the list through the local render engine.",
+                "items": [
+                    "Run a single clip first to confirm your settings.",
+                    "For batches, check each clip's input, hint and output settings.",
+                    "Watch the log and task status for progress or errors.",
+                ],
+                "tip": "Avoid changing or moving source files while a render is running.",
+                "page": "Queue",
+            },
+            {
+                "eyebrow": "05 · OUTPUTS",
+                "title": "5. Choose the right output format",
+                "body": "Choose the format for the job. EXR is intended for scene-linear VFX workflows; PNG creates a 16-bit image sequence; Video creates an encoded review file. PNG writing preserves the renderer's existing pixel values without an extra export colour transform.",
+                "items": [
+                    "EXR: image sequences with the selected EXR compression.",
+                    "PNG: 16-bit image sequences for supported Queue Studio workflows.",
+                    "Video: convenient encoded previews and review files.",
+                ],
+                "tip": "Check the output folder and settings log after your first successful render.",
+                "page": "Queue",
+            },
+            {
+                "eyebrow": "06 · HARDWARE",
+                "title": "6. Check your GPU and preferences",
+                "body": "Open CPU/GPU to review the available hardware and system activity. CorridorKey's inference renderer requires a supported CUDA GPU. Preferences contains interface, preview cache and colour-management options.",
+                "items": [
+                    "Confirm that the NVIDIA GPU is detected before a long render.",
+                    "Keep enough free disk space for image sequences and render outputs.",
+                    "Use Preferences to review OCIO, preview cache and interface settings.",
+                ],
+                "tip": "If a render fails, check the Log and the detailed error section before changing settings.",
+                "page": "CPU/GPU",
+            },
+        ]
+
+        win = ctk.CTkToplevel(self)
+        self._feature_tour_window = win
+        win.title("CorridorKey · First Run Guide")
+        win.geometry("760x520")
+        win.minsize(700, 480)
+        win.resizable(False, False)
+        win.transient(self)
+        win.configure(fg_color=BG)
+        self._set_toplevel_icon(win)
+
+        outer = ctk.CTkFrame(
+            win, fg_color=CARD, corner_radius=18,
+            border_width=1, border_color=SEP)
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(3, weight=1)
+
+        top = ctk.CTkFrame(outer, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=24, pady=(16, 10))
+        top.grid_columnconfigure(1, weight=1)
+
+        # Reuse the application's exact embedded brand mark; keep a strong
+        # reference for the lifetime of the toplevel so Tk never drops it.
+        tour_logo = self.logo_pil.resize((46, 46), Image.LANCZOS)
+        self._feature_tour_logo_image = ctk.CTkImage(
+            light_image=tour_logo, dark_image=tour_logo, size=(46, 46))
+        logo_label = ctk.CTkLabel(
+            top, text="", image=self._feature_tour_logo_image,
+            width=46, height=46)
+        logo_label.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
+
+        brand_title = ctk.CTkLabel(
+            top, text="CORRIDORKEY 2.0",
+            font=ctk.CTkFont(family=FONT, size=16, weight="bold"),
+            text_color=TEXT, anchor="w")
+        brand_title.grid(row=0, column=1, sticky="sw")
+        eyebrow = ctk.CTkLabel(
+            top, text="FIRST-RUN GUIDE",
+            font=ctk.CTkFont(family=FONT, size=10, weight="bold"),
+            text_color=ACCENT, anchor="w")
+        eyebrow.grid(row=1, column=1, sticky="nw", pady=(2, 0))
+        counter = ctk.CTkLabel(
+            top, text="01 / 07", font=self.f_small, text_color=SUBTLE)
+        counter.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
+
+        progress = ctk.CTkProgressBar(
+            outer, height=5, corner_radius=3,
+            fg_color=FIELD, progress_color=ACCENT)
+        progress.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 18))
+
+        content = ctk.CTkFrame(outer, fg_color="transparent")
+        content.grid(row=2, column=0, sticky="nsew", padx=28)
+        content.grid_columnconfigure(0, weight=1)
+        title = ctk.CTkLabel(
+            content, text="", font=ctk.CTkFont(family=FONT, size=25, weight="bold"),
+            text_color=TEXT, anchor="w", justify="left", wraplength=660)
+        title.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        body = ctk.CTkLabel(
+            content, text="", font=self.f_body, text_color=SUBTLE,
+            anchor="w", justify="left", wraplength=660)
+        body.grid(row=1, column=0, sticky="ew", pady=(0, 15))
+
+        points_frame = ctk.CTkFrame(content, fg_color=FIELD, corner_radius=12)
+        points_frame.grid(row=2, column=0, sticky="ew")
+        points_frame.grid_columnconfigure(1, weight=1)
+        point_labels = []
+        for idx in range(3):
+            dot = ctk.CTkLabel(
+                points_frame, text="•", width=22,
+                font=ctk.CTkFont(family=FONT, size=17, weight="bold"),
+                text_color=ACCENT)
+            dot.grid(row=idx, column=0, sticky="n", padx=(14, 4), pady=8)
+            label = ctk.CTkLabel(
+                points_frame, text="", font=self.f_body, text_color=TEXT,
+                anchor="w", justify="left", wraplength=600)
+            label.grid(row=idx, column=1, sticky="ew", padx=(0, 14), pady=8)
+            point_labels.append(label)
+
+        tip = ctk.CTkLabel(
+            outer, text="", fg_color="transparent", font=self.f_small,
+            text_color=ACCENT, anchor="w", justify="left", wraplength=660)
+        tip.grid(row=3, column=0, sticky="ew", padx=28, pady=(14, 8))
+
+        footer = ctk.CTkFrame(outer, fg_color="transparent")
+        footer.grid(row=4, column=0, sticky="ew", padx=22, pady=(8, 18))
+        footer.grid_columnconfigure(2, weight=1)
+        back_btn = ctk.CTkButton(
+            footer, text="Back", width=78, height=34,
+            fg_color=FIELD, hover_color=SEP, text_color=TEXT,
+            command=lambda: show_step(max(0, state["index"] - 1)))
+        back_btn.grid(row=0, column=0, padx=(0, 7))
+        skip_btn = ctk.CTkButton(
+            footer, text="Skip tour", width=88, height=34,
+            fg_color="transparent", hover_color=FIELD, text_color=SUBTLE,
+            command=self._finish_feature_tour)
+        skip_btn.grid(row=0, column=1, padx=4)
+        next_btn = ctk.CTkButton(
+            footer, text="Next", width=108, height=34,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
+            font=ctk.CTkFont(family=FONT, size=11, weight="bold"),
+            command=lambda: advance())
+        next_btn.grid(row=0, column=3, padx=(7, 0))
+
+        state = {"index": 0}
+
+        def show_step(index: int) -> None:
+            index = max(0, min(len(steps) - 1, int(index)))
+            state["index"] = index
+            step = steps[index]
+            eyebrow.configure(text="FIRST-RUN GUIDE  ·  " + step["eyebrow"])
+            counter.configure(text=f"{index + 1:02d} / {len(steps):02d}")
+            progress.set((index + 1) / len(steps))
+            title.configure(text=step["title"])
+            body.configure(text=step["body"])
+            for label, text_value in zip(point_labels, step["items"]):
+                label.configure(text=text_value)
+            tip.configure(text="TIP  ·  " + step["tip"])
+            back_btn.configure(state="normal" if index > 0 else "disabled")
+            if index == len(steps) - 1:
+                next_btn.configure(text="Finish tour", command=self._finish_feature_tour)
+            else:
+                next_btn.configure(text="Next", command=advance)
+
+        def advance() -> None:
+            if state["index"] >= len(steps) - 1:
+                self._finish_feature_tour()
+            else:
+                show_step(state["index"] + 1)
+
+        # Bind after the callbacks exist; keyboard navigation is optional but handy.
+        win.protocol("WM_DELETE_WINDOW", self._close_feature_tour)
+        win.bind("<Escape>", lambda _event: self._close_feature_tour())
+        win.bind("<Right>", lambda _event: advance())
+        win.bind("<Left>", lambda _event: show_step(state["index"] - 1))
+        show_step(0)
+        win.update_idletasks()
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_w = max(760, self.winfo_width())
+        parent_h = max(520, self.winfo_height())
+        x = parent_x + max(0, (parent_w - 760) // 2)
+        y = parent_y + max(0, (parent_h - 520) // 2)
+        win.geometry(f"760x520+{x}+{y}")
+        try:
+            win.grab_set()
+            win.focus_force()
+        except Exception:
+            pass
+
     def _load_preferences_file(self) -> dict:
         defaults = {
             "appearance": "Dark", "interface_theme": DEFAULT_INTERFACE_THEME,
@@ -7849,6 +8173,8 @@ class App(ctk.CTk):
             "sony_lut_dir": str(ROOT / "resources" / "luts" / "sony"),
             "portable_paths": True, "project_root": str(ROOT),
             "photocraft_exe": "",
+            # The welcome tour is shown once after the first successful BAT launch.
+            "first_run_tour_completed": False,
         }
         loaded_data = None
         try:
@@ -7876,6 +8202,8 @@ class App(ctk.CTk):
                     else DEFAULT_WORKSPACE_LAYOUT)
                 defaults["render_gpu"] = bool(data.get("render_gpu", True))
                 defaults["preview_gpu"] = bool(data.get("preview_gpu", True))
+                defaults["first_run_tour_completed"] = bool(
+                    data.get("first_run_tour_completed", False))
                 defaults["preview_fullscreen_mode"] = bool(data.get("preview_fullscreen_mode", False))
                 defaults["portable_paths"] = bool(data.get("portable_paths", True))
                 defaults["project_root"] = str(ROOT)
@@ -7984,6 +8312,8 @@ class App(ctk.CTk):
             "project_root": str(ROOT),
             "photocraft_exe": _portable_store_path(
                 str(self._preferences.get("photocraft_exe", "") or ""), portable),
+            "first_run_tour_completed": bool(
+                self._preferences.get("first_run_tour_completed", False)),
             "last_session": self._capture_last_session(),
         }
         try:

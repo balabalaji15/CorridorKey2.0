@@ -24,7 +24,12 @@ echo ============================================================
 echo Project folder:
 echo %ROOT%
 echo.
+echo This launcher checks your Python environment and CorridorKey engine files.
+echo On the first successful launch, a guided feature tour opens inside the app.
+echo You can replay it later with the Quick Tour button in CorridorKey.
+echo.
 
+echo [1/4] Checking Python environment...
 REM Find a working project virtual environment first.
 if exist "%ROOT%venv\Scripts\python.exe" (
     "%ROOT%venv\Scripts\python.exe" -c "import sys" >nul 2>&1
@@ -84,6 +89,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo [2/4] Checking GUI dependencies...
 REM Install/check GUI dependencies.
 "%PYTHON_EXE%" %PYTHON_ARGS% -c "import customtkinter" >nul 2>&1
 if errorlevel 1 (
@@ -132,6 +138,7 @@ echo OpenColorIO version:
 "%PYTHON_EXE%" %PYTHON_ARGS% -c "import PyOpenColorIO as o; print(o.GetVersion())"
 echo.
 
+echo [3/4] Checking drag-and-drop support...
 REM Confirm drag-and-drop package is importable.
 "%PYTHON_EXE%" %PYTHON_ARGS% -c "import tkinterdnd2; print('TkinterDnD2: ready')" 
 if errorlevel 1 goto :DND_INSTALL_FAILED
@@ -146,7 +153,12 @@ if not exist "%ROOT%corridorkey_gui.py" (
 )
 
 echo.
-echo All required packages are ready.
+echo [4/4] Checking CorridorKey engine modules...
+"%PYTHON_EXE%" %PYTHON_ARGS% -c "import importlib.util; import corridorkey; assert importlib.util.find_spec('corridorkey.color_utils'); assert importlib.util.find_spec('corridorkey.video_io')" >nul 2>&1
+if errorlevel 1 goto :ENGINE_IMPORT_FAILED
+
+echo.
+echo All startup checks passed.
 echo Starting CorridorKey...
 echo.
 "%PYTHON_EXE%" %PYTHON_ARGS% -u "%ROOT%corridorkey_gui.py"
@@ -191,3 +203,17 @@ echo.
 pause
 exit /b 1
 
+
+:ENGINE_IMPORT_FAILED
+echo.
+echo ERROR: CorridorKey backend modules could not be imported.
+echo Check that these files are inside the corridorkey folder:
+echo   corridorkey\__init__.py
+echo   corridorkey\color_utils.py
+echo   corridorkey\video_io.py
+echo   corridorkey\runtime.py
+echo.
+echo Do not copy video_io.py over corridorkey_gui.py.
+echo.
+pause
+exit /b 1
